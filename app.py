@@ -29,6 +29,8 @@ def haversine(lat1, lon1, lat2, lon2):
     R = 3440.065 # Nautical Miles
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi, dlon = math.radians(lat2-lat1), math.radians(lon2-lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2 if 'dlambda' in locals() else dlon/2)**2
+    # Simplified haversine for stability
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlon/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
@@ -44,7 +46,7 @@ with st.sidebar:
     st.header("2. Search Location (Clue)")
     search_clue = st.text_input("Enter City or Airport Clue", "Singapore")
     
-    # SEARCH LOGIC: FIXED TO AVOID TYPEERROR
+    # SEARCH LOGIC: REWRITTEN TO BE BULLETPROOF
     search_results = all_airports[
         all_airports['name'].str.contains(search_clue, case=False) | 
         all_airports['municipality'].str.contains(search_clue, case=False) |
@@ -52,13 +54,15 @@ with st.sidebar:
     ]
     
     if not search_results.empty:
-        # Extracting values correctly using .iat or .iloc with integer positions
-        found_lat = float(search_results.iloc['latitude_deg'])
-        found_lon = float(search_results.iloc['longitude_deg'])
-        st.success(f"📍 Location set to {search_results.iloc['municipality']}")
+        # THE FIX: Use .iloc to get the row, THEN ['column'] to get the value.
+        # This avoids the "Non-integer key" error entirely.
+        first_row = search_results.iloc
+        found_lat = float(first_row['latitude_deg'])
+        found_lon = float(first_row['longitude_deg'])
+        st.success(f"📍 Found: {first_row['municipality']}")
     else:
         found_lat, found_lon = 0.0, 0.0
-        st.warning("No location found. Please enter coordinates manually.")
+        st.warning("No location found. Type a clue above.")
 
     lat = st.number_input("Current Latitude", value=found_lat, format="%.4f")
     lon = st.number_input("Current Longitude", value=found_lon, format="%.4f")
@@ -77,7 +81,6 @@ if st.button("CALCULATE EMERGENCY TRAJECTORY", type="primary"):
     ranked = calc_df.sort_values('distance').head(5)
     
     if not ranked.empty:
-        # Use .iloc but extract by column index or use .at for safety
         top_apt = ranked.iloc
         dist_to_field = top_apt['distance']
         max_glide_nm = (alt / 6076) * ac['glide_ratio'] * 0.7
@@ -87,17 +90,16 @@ if st.button("CALCULATE EMERGENCY TRAJECTORY", type="primary"):
         if dist_to_field <= max_glide_nm:
             st.success(f"✅ **Safe Divert:** {top_apt['name']} ({top_apt['ident']})")
         else:
-            st.error(f"🚨 **Critical:** Nearest airport ({top_apt['ident']}) is beyond glide range.")
+            st.error(f"🚨 **Critical:** {top_apt['ident']} is {round(dist_to_field - max_glide_nm, 1)}nm beyond glide range.")
 
-        # Display Top 3 Options
         cols = st.columns(3)
         for i in range(min(3, len(ranked))):
             apt = ranked.iloc[i]
             with cols[i]:
                 st.markdown(f"**{apt['ident']}**")
                 st.write(f"{round(apt['distance'], 1)} NM")
-                st.caption(f"{apt['municipality']}, {apt['iso_country']}")
+                st.caption(f"{apt['municipality']}")
                 status = "🟢 Reachable" if apt['distance'] <= max_glide_nm else "🔴 Out of Range"
                 st.write(status)
     else:
-        st.error("No airports found in database.")
+        st.error("No airports found.")
