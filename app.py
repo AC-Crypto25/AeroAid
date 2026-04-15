@@ -27,7 +27,6 @@ AIRCRAFT_DATA = {
     "Airbus A320": {"glide_ratio": 17, "min_runway": 6000, "v_glide_max": 200, "empty_wt": 94000, "max_fuel": 42000},
 }
 
-AIRLINES = ["American Airlines", "British Airways", "Delta Air Lines", "Emirates", "Lufthansa", "Qantas", "Singapore Airlines", "United Airlines"]
 EMERGENCIES = ["Dual Engine Failure", "Single Engine Failure", "Rapid Depressurization", "Hydraulic System Loss", "Electrical Smoke/Fire"]
 
 @st.cache_data
@@ -42,7 +41,9 @@ def load_runways():
     hard_surfaces = ['ASP', 'CON', 'ASPH', 'CONC', 'MAC', 'PEM']
     df = df[df['surface'].astype(str).str.upper().isin(hard_surfaces)]
     df['le_heading_degT'] = pd.to_numeric(df['le_heading_degT'], errors='coerce')
-    return df
+    df['he_heading_degT'] = pd.to_numeric(df['he_heading_degT'], errors='coerce')
+    df['length_ft'] = pd.to_numeric(df['length_ft'], errors='coerce')
+    return df.dropna(subset=['length_ft'])
 
 @st.cache_data
 def load_frequencies():
@@ -52,7 +53,7 @@ all_airports = load_airports()
 all_runways = load_runways()
 all_freqs = load_frequencies()
 
-# --- 2. ADVANCED MATH & LIVE APIs ---
+# --- 2. ADVANCED MATH & IDEAL PATH LOGIC ---
 def haversine(lat1, lon1, lat2, lon2):
     R = 3440.065 
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
@@ -60,77 +61,66 @@ def haversine(lat1, lon1, lat2, lon2):
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlon/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-def check_notam_closure(icao, api_key):
-    """Hits the FAA NOTAM API to search for runway closures."""
-    if not api_key: 
-        return False # Bypass if no key provided by user
-        
-    url = f"https://external-api.faa.gov/notamapi/v1/notams?icaoLocation={icao}"
-    headers = {"client_id": api_key}
-    
+def get_live_metar(icao):
+    """Fetches the absolute latest weather report for wind alignment calculation."""
     try:
-        response = requests.get(url, headers=headers, timeout=5)
-        if response.status_code == 200:
-            notams = response.json().get('items', [])
-            for notam in notams:
-                text = notam.get('properties', {}).get('coreNOTAMData', {}).get('notamText', '').upper()
-                if "RWY CLSD" in text or "RUNWAY CLOSED" in text:
-                    return True # Hard failure - runway is closed
-    except Exception as e:
-        st.sidebar.error(f"NOTAM API Error: {e}")
-    return False
+        url = f"https://aviationweather.gov/api/data/metar?ids={icao}&format=json&hours=1"
+        response = requests.get(url, timeout=3)
+        data = response.json()
+        if data: return {"wdir": data[0].get("wdir", 0), "wspd": data[0].get("wspd", 0)}
+    except: return None
+    return {"wdir": 0, "wspd": 0} # Fallback to calm winds if API fails
 
-def generate_terrain_masked_ring(center_lat, center_lon, radius_nm, ac_alt_ft, points=36):
-    """Uses OpenTopoData API to explicitly mask the glide ring based on MSA."""
-    ring = []
-    lat_deg_per_nm = 1 / 60.0
-    lon_deg_per_nm = 1 / (60.0 * math.cos(math.radians(center_lat)))
-    
-    coords = []
-    for i in range(points):
-        angle = math.radians(float(i) / points * 360.0)
-        d_lat = radius_nm * math.cos(angle) * lat_deg_per_nm
-        d_lon = radius_nm * math.sin(angle) * lon_deg_per_nm
-        coords.append((center_lat + d_lat, center_lon + d_lon))
-    
-    # Live elevation query
-    locations_str = "|".join([f"{lat},{lon}" for lat, lon in coords])
-    url = f"https://api.opentopodata.org/v1/srtm90m?locations={locations_str}"
-    
-    try:
-        response = requests.get(url, timeout=10)
-        elev_data = response.json().get('results', [])
+def score_airport(distance, max_glide, runways_df, wind_dir, wind_spd, ac_min_rwy):
+    """
+    The Suitability Matrix: Scores airports out of 100 based on survivability.
+    """
+    score = 100.0
+    best_rwy = None
+    best_hw_comp = -999
+    max_len_found = 0
+
+    # 1. Energy Margin Penalty (If it's at the absolute edge of glide, it's risky)
+    glide_ratio_used = distance / max_glide
+    if glide_ratio_used > 0.85: score -= 30  # High risk of falling short
+    elif glide_ratio_used < 0.2: score -= 10 # Too close, high energy management required
+    else: score += 10 # Ideal energy margin
+
+    # 2. Evaluate Runways for Length and Wind Alignment
+    for _, rwy in runways_df.iterrows():
+        rwy_len = rwy['length_ft']
         
-        for i, res in enumerate(elev_data):
-            elev_meters = res.get('elevation', 0)
-            elev_ft = elev_meters * 3.28084 if elev_meters else 0
-            
-            # If terrain eats the 1,000ft safety buffer, crush the glide ring on this vector
-            if elev_ft > (ac_alt_ft - 1000):
-                mod_radius = radius_nm * 0.2 # Massive penalty for terrain intersection
-                d_lat = mod_radius * math.cos(math.radians(float(i) / points * 360.0)) * lat_deg_per_nm
-                d_lon = mod_radius * math.sin(math.radians(float(i) / points * 360.0)) * lon_deg_per_nm
-                ring.append([center_lon + d_lon, center_lat + d_lat])
-            else:
-                ring.append([coords[i][1], coords[i][0]])
-    except Exception as e:
-        st.error(f"TERRAIN API FAILURE: {e}. Defaulting to unmasked ring.")
-        for lat, lon in coords:
-            ring.append([lon, lat])
-            
-    return [ring]
+        # Check both ends of the runway
+        for hdg_col, ident_col in [('le_heading_degT', 'le_ident'), ('he_heading_degT', 'he_ident')]:
+            if not pd.isna(rwy[hdg_col]):
+                rwy_hdg = rwy[hdg_col]
+                
+                # Wind calculation
+                angle_diff = math.radians(wind_dir - rwy_hdg)
+                headwind = wind_spd * math.cos(angle_diff)
+                crosswind = abs(wind_spd * math.sin(angle_diff))
+                
+                # We want maximum headwind, minimum crosswind, maximum length
+                rwy_score = 0
+                rwy_score += (rwy_len - ac_min_rwy) / 100  # Bonus for extra length
+                rwy_score += headwind * 2                  # Bonus for headwind
+                rwy_score -= crosswind * 3                 # Severe penalty for crosswind
+                
+                if rwy_score > best_hw_comp:
+                    best_hw_comp = rwy_score
+                    best_rwy = rwy[ident_col]
+                    max_len_found = rwy_len
 
-def calculate_time_to_impact(distance_nm, groundspeed_kts):
-    if groundspeed_kts <= 0: return "N/A"
-    time_hours = distance_nm / groundspeed_kts
-    return f"{int(time_hours * 60):02d}:{int((time_hours * 60 % 1) * 60):02d}"
+    # Apply best runway stats to total airport score
+    score += best_hw_comp
+    
+    return score, best_rwy, max_len_found
 
 # --- 3. UI: SIDEBAR INPUTS ---
-st.title("✈️ AeroAid Pro: EFB Level D")
+st.title("✈️ AeroAid Pro: Level D (Survival Protocol)")
 
 with st.sidebar:
     st.header("1. Flight Status")
-    airline = st.selectbox("Airline Operator", AIRLINES)
     ac_type = st.selectbox("Aircraft", list(AIRCRAFT_DATA.keys()))
     fuel_pct = st.slider("Current Fuel %", 0, 100, 50)
     
@@ -140,31 +130,25 @@ with st.sidebar:
     icing_conditions = st.checkbox("❄️ Icing Conditions (Anti-Ice ON)", value=False)
     
     st.markdown("---")
-    st.header("🔑 ENTERPRISE APIs")
-    faa_api_key = st.text_input("FAA NOTAM API Key", type="password", help="Leave blank to bypass NOTAM check.")
-    
-    st.markdown("---")
     st.header("2. Position Data")
     search_clue = st.text_input("City/Clue Search", "Denver")
     
     search_results = all_airports[
         all_airports['name'].str.contains(search_clue, case=False, na=False) | 
-        all_airports['municipality'].str.contains(search_clue, case=False, na=False) |
         all_airports['ident'].str.contains(search_clue, case=False, na=False)
     ]
     
     if not search_results.empty:
-        first_row = search_results.iloc[0]
-        found_lat, found_lon = float(first_row['latitude_deg']), float(first_row['longitude_deg'])
-        st.success(f"📍 GPS Lock: {first_row['ident']}")
+        found_lat, found_lon = float(search_results.iloc[0]['latitude_deg']), float(search_results.iloc[0]['longitude_deg'])
+        st.success(f"📍 GPS Lock: {search_results.iloc[0]['ident']}")
     else:
         found_lat, found_lon = 0.0, 0.0
 
     lat = st.number_input("Latitude", value=found_lat, format="%.4f")
     lon = st.number_input("Longitude", value=found_lon, format="%.4f")
-    alt = st.number_input("Altitude (MSL ft)", value=25000, step=1000)
+    alt = st.number_input("Altitude (MSL ft)", value=30000, step=1000)
 
-# --- AIRCRAFT PERFORMANCE & DEGRADATION LOGIC ---
+# --- AIRCRAFT PERFORMANCE LOGIC ---
 ac = AIRCRAFT_DATA[ac_type]
 current_wt = ac['empty_wt'] + (ac['max_fuel'] * (fuel_pct / 100))
 max_wt = ac['empty_wt'] + ac['max_fuel']
@@ -173,41 +157,51 @@ v_glide = ac['v_glide_max'] * math.sqrt(current_wt / max_wt)
 effective_glide_ratio = ac['glide_ratio'] * 0.7
 effective_alt = max(alt - 1500, 0)
 
-if "Hydraulic System Loss" in active_emergencies:
-    effective_glide_ratio *= 0.85
-if icing_conditions:
+if "Hydraulic System Loss" in active_emergencies: effective_glide_ratio *= 0.85
+if icing_conditions: 
     effective_glide_ratio *= 0.75 
     v_glide += 10 
 
 max_glide_nm = (effective_alt / 6076) * effective_glide_ratio
 v_ref = v_glide * 0.7
 
-st.sidebar.markdown("---")
-st.sidebar.metric("ESTIMATED V-REF (FLAPS FULL)", f"{int(v_ref)} KTS")
-
-# --- GLOBAL AIRPORT FILTERING & LIVE NOTAM CHECK ---
+# --- THE "IDEAL" AIRPORT SELECTION ---
 valid_runways = all_runways[all_runways['length_ft'] >= ac['min_runway']]
 valid_airport_idents = valid_runways['airport_ident'].unique()
 
 calc_df = all_airports[all_airports['ident'].isin(valid_airport_idents)].copy()
 calc_df['distance'] = calc_df.apply(lambda row: haversine(lat, lon, row['latitude_deg'], row['longitude_deg']), axis=1)
 
-ranked_airports = calc_df.sort_values('distance')
-top_apt = None
+# Filter out airports beyond absolute max glide
+reachable_airports = calc_df[calc_df['distance'] <= max_glide_nm].copy()
 
-with st.spinner("Ping FAA API for NOTAMs..."):
-    for _, apt in ranked_airports.iterrows():
-        # Executes the live check against the actual API
-        if not check_notam_closure(apt['ident'], faa_api_key):
-            top_apt = apt
-            break
-
-if top_apt is None:
-    st.error("SYSTEM FAILURE: No open runways found. All nearby valid airports have RWY CLSD NOTAMs.")
+if reachable_airports.empty:
+    st.error("SYSTEM FAILURE: NO REACHABLE HARD-SURFACE RUNWAYS. PREPARE FOR OFF-FIELD LANDING/DITCHING.")
     st.stop()
 
+# Evaluate the Suitability Score for all reachable airports
+scored_airports = []
+with st.spinner("Calculating Suitability Matrix & Fetching Live Weather..."):
+    for _, apt in reachable_airports.iterrows():
+        apt_runways = valid_runways[valid_runways['airport_ident'] == apt['ident']]
+        wx = get_live_metar(apt['ident'])
+        
+        score, best_rwy, best_len = score_airport(
+            apt['distance'], max_glide_nm, apt_runways, 
+            wx['wdir'], wx['wspd'], ac['min_runway']
+        )
+        scored_airports.append({
+            "apt_data": apt, "score": score, "best_rwy": best_rwy, 
+            "rwy_len": best_len, "wx": wx
+        })
+
+# Sort by highest survivability score, not closest distance
+scored_airports.sort(key=lambda x: x['score'], reverse=True)
+ideal_target = scored_airports[0]
+top_apt = ideal_target['apt_data']
+
 # --- GOLDEN RULE UI SPLIT ---
-tab_aviate, tab_navigate, tab_communicate = st.tabs(["⚠️ PRIMARY FLIGHT (AVIATE)", "🗺️ AIRPORT & VNAV (NAVIGATE)", "📻 CHECKLISTS & COMMS (COMMUNICATE)"])
+tab_aviate, tab_navigate, tab_communicate = st.tabs(["⚠️ PRIMARY FLIGHT (AVIATE)", "🗺️ ROUTING & ENERGY (NAVIGATE)", "📻 COMMS (COMMUNICATE)"])
 
 # ==========================================
 # TAB 1: AVIATE
@@ -216,12 +210,9 @@ with tab_aviate:
     st.error(f"🚨 MASTER CAUTION: {len(active_emergencies)} FAILURES DETECTED")
     st.markdown("<div class='pfd-card'>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns(3)
-    col1.metric("TARGET V-GLIDE", f"{int(v_glide)} KTS", delta="+10 ICE" if icing_conditions else None, delta_color="inverse")
+    col1.metric("TARGET V-GLIDE", f"{int(v_glide)} KTS")
     col2.metric("MAX GLIDE RANGE", f"{round(max_glide_nm, 1)} NM")
     col3.metric("REACTION ALTITUDE", f"{int(effective_alt)} FT")
-    
-    if current_wt > (ac['empty_wt'] * 1.4):
-        st.markdown(f"<span style='color:#ff0000;'><b>⚠️ OVERWEIGHT LANDING:</b> Weight ({int(current_wt):,} lbs) exceeds MLW.</span>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("### ⚡ IMMEDIATE ACTION ITEMS")
@@ -236,43 +227,44 @@ with tab_aviate:
     st.markdown(checklist_html, unsafe_allow_html=True)
 
 # ==========================================
-# TAB 2: NAVIGATE
+# TAB 2: NAVIGATE (ENERGY MANAGEMENT)
 # ==========================================
 with tab_navigate:
-    st.subheader(f"TARGET: {top_apt['name']} ({top_apt['ident']})")
-    tti_str = calculate_time_to_impact(top_apt['distance'], v_glide)
-
-    col_v1, col_v2 = st.columns(2)
-    col_v1.metric("DIST TO FIELD", f"{round(top_apt['distance'], 1)} NM")
-    col_v2.metric("TIME TO IMPACT", tti_str)
+    st.subheader(f"IDEAL TARGET: {top_apt['name']} ({top_apt['ident']})")
     
+    wx = ideal_target['wx']
+    st.info(f"📡 WEATHER DATALINK: Wind {wx['wdir']:03d}° at {wx['wspd']} KTS | Ideal Runway: {ideal_target['best_rwy']} ({int(ideal_target['rwy_len'])} FT)")
+    
+    # High Key Logic (Aiming 3000ft above the field, not the runway threshold)
     field_elevation = top_apt.get('elevation_ft', 0) if not pd.isna(top_apt.get('elevation_ft', 0)) else 0
+    high_key_alt = field_elevation + 3000
     glide_gradient = 6076 / effective_glide_ratio 
-
-    st.markdown("### 📉 VERTICAL PROFILE (VNAV)")
-    dist_steps = np.linspace(top_apt['distance'], 0, 10)
-    required_alt_profile = (dist_steps * glide_gradient) + field_elevation
-    actual_alt_profile = np.linspace(effective_alt, field_elevation, 10)
-
-    chart_df = pd.DataFrame({
-        "Distance to Field (NM)": dist_steps,
-        "Glide Path (Required)": required_alt_profile,
-        "Your Profile (Projected)": actual_alt_profile
-    }).set_index("Distance to Field (NM)")
-
-    st.area_chart(chart_df, color=["#ff0000", "#00ff00"])
     
-    st.markdown("### 🌍 SITUATIONAL AWARENESS DISPLAY (SAD)")
-    with st.spinner("Masking Terrain Data..."):
-        glide_ring_coords = generate_terrain_masked_ring(lat, lon, max_glide_nm, alt)
+    alt_needed_for_straight_in = (top_apt['distance'] * glide_gradient) + field_elevation
+    excess_energy = effective_alt - alt_needed_for_straight_in
+    
+    col_v1, col_v2, col_v3 = st.columns(3)
+    col_v1.metric("DIST TO FIELD", f"{round(top_apt['distance'], 1)} NM")
+    col_v2.metric("MIN TARGET ALT", f"{int(alt_needed_for_straight_in)} FT")
+    
+    if excess_energy > 3000:
+        col_v3.metric("ENERGY STATE", "HIGH", delta=f"+{int(excess_energy)} FT", delta_color="inverse")
+        st.warning("⚠️ HIGH ENERGY: Track to High Key (3000' AGL over field). Execute 360° S-Turns to burn altitude.")
+    elif excess_energy < 0:
+        col_v3.metric("ENERGY STATE", "CRITICAL", delta=f"{int(excess_energy)} FT", delta_color="inverse")
+        st.error("⚠️ LOW ENERGY: Glide compromised. Delay gear and flaps until runway is assured.")
+    else:
+        col_v3.metric("ENERGY STATE", "OPTIMAL", delta="ON GLIDEPATH")
+        st.success("✅ OPTIMAL ENERGY: Execute straight-in approach to High Key transition.")
 
+    st.markdown("### 🌍 SITUATIONAL AWARENESS DISPLAY")
     view_state = pdk.ViewState(latitude=lat, longitude=lon, zoom=8, pitch=30)
     st.pydeck_chart(pdk.Deck(
         map_style='mapbox://styles/mapbox/dark-v10',
         layers=[
-            pdk.Layer("PolygonLayer", data=[{"polygon": glide_ring_coords[0]}], get_polygon="polygon", get_fill_color="[0, 255, 0, 30]", get_line_color="[0, 255, 0, 200]", line_width_min_pixels=3),
-            pdk.Layer("ScatterplotLayer", data=[{"lat": float(top_apt['latitude_deg']), "lon": float(top_apt['longitude_deg'])}], get_position="[lon, lat]", get_color="[0, 255, 0, 200]", get_radius=1200, radius_min_pixels=8),
-            pdk.Layer("ScatterplotLayer", data=[{"lat": lat, "lon": lon}], get_position="[lon, lat]", get_color="[255, 255, 255, 255]", get_radius=800, radius_min_pixels=6)
+            pdk.Layer("ScatterplotLayer", data=[{"lat": float(top_apt['latitude_deg']), "lon": float(top_apt['longitude_deg'])}], get_position="[lon, lat]", get_color="[0, 255, 0, 255]", get_radius=1500),
+            pdk.Layer("ScatterplotLayer", data=[{"lat": lat, "lon": lon}], get_position="[lon, lat]", get_color="[255, 255, 255, 255]", get_radius=800),
+            pdk.Layer("LineLayer", data=[{"start": [lon, lat], "end": [float(top_apt['longitude_deg']), float(top_apt['latitude_deg'])]}], get_source_position="start", get_target_position="end", get_color="[0, 255, 0, 200]", get_width=5)
         ], 
         initial_view_state=view_state
     ))
@@ -299,14 +291,3 @@ with tab_communicate:
         st.markdown(freq_html, unsafe_allow_html=True)
     else:
         st.markdown("<div class='pfd-card pfd-warning'>⚠️ NO LOCAL ATC PUBLISHED. TRANSMIT ON 121.500 (GUARD).</div>", unsafe_allow_html=True)
-        
-    st.markdown("### 📋 SECONDARY NON-NORMAL CHECKLISTS")
-    st.markdown("""
-    <div class='pfd-card'>
-        <ul>
-            <li><b>TRANSPONDER:</b> SQUAWK 7700</li>
-            <li><b>MAYDAY CALL:</b> "MAYDAY, MAYDAY, MAYDAY. [Callsign] HAS EXPERIENCED [Emergency]. INTENTIONS TO DIVERT TO [Target Field]."</li>
-            <li><b>CABIN CREW:</b> NOTIFY "BRACE FOR IMPACT" PREPARATIONS.</li>
-        </ul>
-    </div>
-    """, unsafe_allow_html=True)
