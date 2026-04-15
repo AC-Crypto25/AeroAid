@@ -62,14 +62,26 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 def get_live_metar(icao):
-    """Fetches the absolute latest weather report for wind alignment calculation."""
+    """Fetches the absolute latest weather report for wind alignment calculation with failsafes."""
     try:
         url = f"https://aviationweather.gov/api/data/metar?ids={icao}&format=json&hours=1"
         response = requests.get(url, timeout=3)
         data = response.json()
-        if data: return {"wdir": data[0].get("wdir", 0), "wspd": data[0].get("wspd", 0)}
-    except: return None
-    return {"wdir": 0, "wspd": 0} # Fallback to calm winds if API fails
+        if data: 
+            wdir = data[0].get("wdir")
+            wspd = data[0].get("wspd")
+            
+            # Handle cases where the API returns "VRB" (variable) or missing data as strings/None
+            wdir = int(wdir) if wdir not in [None, "VRB"] else 0
+            wspd = int(wspd) if wspd not in [None, ""] else 0
+            
+            return {"wdir": wdir, "wspd": wspd}
+    except Exception:
+        # If the API drops, times out, or formats weirdly, fail safely.
+        pass 
+        
+    # FAILSAFE: Return calm winds so the app survives the data drop
+    return {"wdir": 0, "wspd": 0}
 
 def score_airport(distance, max_glide, runways_df, wind_dir, wind_spd, ac_min_rwy):
     """
