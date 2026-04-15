@@ -29,8 +29,7 @@ def haversine(lat1, lon1, lat2, lon2):
     R = 3440.065 # Nautical Miles
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi, dlon = math.radians(lat2-lat1), math.radians(lon2-lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2 if 'dlambda' in locals() else dlon/2)**2
-    # Simplified haversine for stability
+    # Cleaned up the redundant assignment here
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlon/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
@@ -46,17 +45,16 @@ with st.sidebar:
     st.header("2. Search Location (Clue)")
     search_clue = st.text_input("Enter City or Airport Clue", "Singapore")
     
-    # SEARCH LOGIC: REWRITTEN TO BE BULLETPROOF
+    # SEARCH LOGIC: Added na=False to prevent crashes on missing data
     search_results = all_airports[
-        all_airports['name'].str.contains(search_clue, case=False) | 
-        all_airports['municipality'].str.contains(search_clue, case=False) |
-        all_airports['ident'].str.contains(search_clue, case=False)
+        all_airports['name'].str.contains(search_clue, case=False, na=False) | 
+        all_airports['municipality'].str.contains(search_clue, case=False, na=False) |
+        all_airports['ident'].str.contains(search_clue, case=False, na=False)
     ]
     
     if not search_results.empty:
-        # THE FIX: Use .iloc to get the row, THEN ['column'] to get the value.
-        # This avoids the "Non-integer key" error entirely.
-        first_row = search_results.iloc
+        # THE FIX: Added [0] to explicitly grab the very first row
+        first_row = search_results.iloc[0]
         found_lat = float(first_row['latitude_deg'])
         found_lon = float(first_row['longitude_deg'])
         st.success(f"📍 Found: {first_row['municipality']}")
@@ -81,7 +79,8 @@ if st.button("CALCULATE EMERGENCY TRAJECTORY", type="primary"):
     ranked = calc_df.sort_values('distance').head(5)
     
     if not ranked.empty:
-        top_apt = ranked.iloc
+        # THE FIX: Added [0] here as well
+        top_apt = ranked.iloc[0]
         dist_to_field = top_apt['distance']
         max_glide_nm = (alt / 6076) * ac['glide_ratio'] * 0.7
         
